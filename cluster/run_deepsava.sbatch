@@ -5,7 +5,7 @@
 #SBATCH --partition=debug
 #SBATCH --account=thesis
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=1
 #SBATCH --mem=8G
 #SBATCH --gres=mps:30
 #SBATCH --time=00:30:00
