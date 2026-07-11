@@ -5,13 +5,17 @@ import csv
 import numpy as np
 import random
 import glob
-import os.path
+import os
+import tempfile
 import pandas as pd
 import sys
 import operator
 from processor import process_image
 import tensorflow as tf
 import cv2
+
+VIDEO_EXTENSIONS = {'.avi', '.mp4', '.mov', '.mkv', '.wmv', '.mjpeg'}
+
 class DataSet():
 
     def __init__(self, data_set = 'UCF101',seq_length=40, class_limit=None, data_list='/video_data/data_file.csv',
@@ -200,18 +204,71 @@ class DataSet():
             return None
 
     @staticmethod
+    def is_video_file(path):
+        """Return True when the path points to a directly supported video file."""
+        return isinstance(path, str) and os.path.isfile(path) and os.path.splitext(path)[1].lower() in VIDEO_EXTENSIONS
+
+    @staticmethod
+    def extract_frames_from_video(video_path, video_name=None):
+        """Extract frames from a video file into temporary JPEG files."""
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError('Could not open video file: %s' % video_path)
+
+        temp_dir = tempfile.mkdtemp(prefix='deepsava_frames_', dir=os.getcwd())
+        frame_paths = []
+        frame_index = 0
+        base_name = video_name or os.path.splitext(os.path.basename(video_path))[0]
+
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frame_index += 1
+            frame_path = os.path.join(temp_dir, '%s_%05d.jpg' % (base_name, frame_index))
+            if cv2.imwrite(frame_path, frame):
+                frame_paths.append(frame_path)
+
+        cap.release()
+        return frame_paths, video_name or os.path.basename(video_path)
+
+    @staticmethod
     def get_frames_for_sample(data_set,sample):
         """Given a sample row from the data file, get all the corresponding frame
-        filenames."""
+        filenames. Supports either pre-extracted JPG frames or direct video files."""
+        if len(sample) < 3:
+            return [], None
+
+        video_name = sample[2]
+        video_candidates = []
+        if video_name:
+            if os.path.isabs(video_name):
+                video_candidates.append(video_name)
+            else:
+                video_candidates.extend([
+                    video_name,
+                    os.path.join(os.getcwd(), video_name),
+                    os.path.join(data_set, video_name),
+                    os.path.join(data_set, 'video_data', video_name),
+                    os.path.join(data_set, 'video_data', sample[0], video_name),
+                    os.path.join(data_set, 'video_data', sample[0], sample[1], video_name),
+                    os.path.join(data_set, 'video_data', sample[0], sample[1], os.path.basename(video_name)),
+                ])
+
+        for candidate in video_candidates:
+            if DataSet.is_video_file(candidate):
+                return DataSet.extract_frames_from_video(candidate, candidate)
+
+        if video_name and os.path.isdir(video_name):
+            images = sorted(glob.glob(os.path.join(video_name, '*.jpg')))
+            return images, os.path.basename(video_name)
+
         if data_set == 'UCF101':
             path = data_set+'/video_data/' + sample[0] + '/' + sample[1] + '/'
             filename = sample[2]
-            #print(path, filename)
             images = sorted(glob.glob(path + filename + '*.jpg'))
         else:
             path = data_set+'/video_data/' + sample[0] + '/' + sample[1] + '/'+sample[2]+'/'
-            
-            #print(path, filename)
             images = sorted(glob.glob(path  + '*.jpg'))
         return images,sample[2]
 

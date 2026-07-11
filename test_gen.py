@@ -3,6 +3,7 @@ import argparse
 import os
 import sys
 import shutil
+import tempfile
 import models
 import numpy as np
 import tensorflow as tf
@@ -530,6 +531,10 @@ def main():
                         help='Max number of images to be evaluated.')
     parser.add_argument('--file_list', type=str, default=None,
                         help='Evaluate a specific list of file in dataset.')
+    parser.add_argument('--video_path', type=str, default=None,
+                        help='Path to a single video file (avi/mp4/mov/etc.) to test directly.')
+    parser.add_argument('--video_class', type=str, default='test',
+                        help='Class label to use when --video_path is provided.')
     parser.add_argument('--num_iter', type=int, default=100,
                         help='Number of iterations to generate attack.')
     parser.add_argument('--save_freq', type=int, default=5,
@@ -551,6 +556,12 @@ def main():
     args = parser.parse_args()
     print(args.file_list)
     assert args.num_iter % args.save_freq == 0
+
+    if args.video_path is not None and args.file_list is None:
+        temp_csv = tempfile.NamedTemporaryFile('w', suffix='.csv', delete=False, dir=os.getcwd())
+        temp_csv.write('test,%s,%s,40\n' % (args.video_class, os.path.abspath(args.video_path)))
+        temp_csv.close()
+        args.file_list = temp_csv.name
 
     data_spec = models.get_data_spec(model_name=args.model)
     args.learning_rate = args.learning_rate / 255.0 * (data_spec.rescale[1] - data_spec.rescale[0])
