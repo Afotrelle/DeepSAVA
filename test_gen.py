@@ -1,5 +1,6 @@
 ######For one video each a time 
 import argparse
+import csv
 import os
 import sys
 import shutil
@@ -203,6 +204,32 @@ def toimage(arr, high=255, low=0, cmin=None, cmax=None, pal=None,
     image = Image.frombytes(mode, shape, strdata)
     return image
 
+
+def write_video_from_rgb_frames(frames_rgb, output_base_path, fps):
+    """Write RGB frames to disk, preferring MP4 and falling back to AVI."""
+    if not frames_rgb:
+        return None
+
+    height, width = frames_rgb[0].shape[:2]
+    candidates = [
+        (output_base_path + '.mp4', cv2.VideoWriter_fourcc(*'mp4v')),
+        (output_base_path + '.avi', cv2.VideoWriter_fourcc(*'MJPG')),
+    ]
+
+    for output_path, fourcc in candidates:
+        writer = cv2.VideoWriter(output_path, fourcc, float(fps), (width, height))
+        if not writer.isOpened():
+            continue
+
+        for frame_rgb in frames_rgb:
+            if frame_rgb.shape[:2] != (height, width):
+                frame_rgb = cv2.resize(frame_rgb, (width, height))
+            writer.write(cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
+        writer.release()
+        return output_path
+
+    return None
+
 def calc_gradients(
         test_file,
         data_set_name,
@@ -217,7 +244,10 @@ def calc_gradients(
         data_spec=None,
         batch_size=1,
         total_len=40,
-        seq_len = 10):
+        seq_len = 10,
+        single_video_mode=False,
+        output_fps=25.0,
+        metrics_csv_path=None):
 
     """Compute the gradients for the given network and images."""
     spec = data_spec
@@ -285,8 +315,9 @@ def calc_gradients(
         true_image = tf.concat([true_image, true_image_temp],0)
     
     loss2_l12 = tf.reduce_sum(tf.sqrt(tf.reduce_mean(tf.square(true_image-input_image), axis=[0, 2, 3, 4])))
-    
-    loss2 =  tf.reduce_sum(1-tf.image.ssim_multiscale(true_image, input_image, max_val=1.0))
+
+    ssim_per_video = tf.image.ssim_multiscale(true_image, input_image, max_val=1.0)
+    loss2 =  tf.reduce_sum(1-ssim_per_video)
     #loss2 = 1.0 - tf.reduce_mean(SSIM(true_image).cw_ssim_value(input_image))
     
     norm_frame = tf.reduce_mean(tf.abs(modifier), axis=[2,3,4])
@@ -344,6 +375,51 @@ def calc_gradients(
     f = open("rotate_ssim_hcm.txt", "a+")
     print('process data length:', num_batch,file=f)
 
+    if not os.path.exists(output_file_dir):
+        os.makedirs(output_file_dir)
+    if metrics_csv_path is None:
+        metrics_csv_path = os.path.join(output_file_dir, 'attack_metrics.csv')
+    elif not os.path.isabs(metrics_csv_path):
+        metrics_csv_path = os.path.join(output_file_dir, metrics_csv_path)
+    summary_csv_path = os.path.splitext(metrics_csv_path)[0] + '_summary.csv'
+    metric_fields = [
+        'video_name',
+        'label',
+        'clean_pred',
+        'adv_pred',
+        'attack_attempted',
+        'attack_success',
+        'status',
+        'iterations',
+        'attack_time_sec',
+        'selected_frames',
+        'mean_abs_perturbation',
+        'l2_perturbation',
+        'nonzero_fraction',
+        'ssim_orig_vs_attacked',
+        'content_loss_ssim_proxy',
+        'content_loss_l12',
+    ]
+    metrics_file = open(metrics_csv_path, 'w')
+    metrics_writer = csv.DictWriter(metrics_file, fieldnames=metric_fields)
+    metrics_writer.writeheader()
+
+    agg_total_videos = 0
+    agg_attacked_videos = 0
+    agg_successful_attacks = 0
+    agg_iterations_sum = 0.0
+    agg_attack_time_sum = 0.0
+    agg_ssim_sum = 0.0
+    agg_mean_abs_pert_sum = 0.0
+    agg_l2_pert_sum = 0.0
+    agg_nonzero_fraction_sum = 0.0
+    attacked_iterations = []
+    attacked_times = []
+    attacked_ssim = []
+    attacked_mean_abs_pert = []
+    attacked_l2_pert = []
+    attacked_nonzero_fraction = []
+
     correct_ori = 0
     correct_noi = 0
     tot_image = 0
@@ -372,6 +448,8 @@ def calc_gradients(
         
         feed_dict = {input_image: images[0:total_len], input_label: labels,tau: 0.05,indicator:indicator_ini,theta:np.zeros((seq_len))}
         var_loss, true_prob, var_loss1, var_loss2, var_l12loss,var_pre= sess.run((loss, true_label_prob, loss1, loss2,loss2_l12, pre_label), feed_dict=feed_dict)
+        clean_preds = np.array(var_pre)
+        clean_probs = np.array(true_prob)
         
         correct_pre = correct_ori
         for xx in range(len(indices)):
@@ -387,136 +465,285 @@ def calc_gradients(
         print('label loss:', var_loss1, 'content loss:', var_loss2, 'prediction:', var_pre, 'probib', true_prob,'var_l12loss',var_l12loss)
         # record numer of iteration
         tot_iter = 0
+        attack_attempted = True
+        status = 'attacked'
+        attack_success = False
+        attack_time_sec = 0.0
+        var_diff = None
+        var_probs = None
+        noise_norm = None
+        final_ssim = None
+        final_var_loss2 = None
+        final_var_l12loss = None
+        adv_preds = np.array(clean_preds)
+        mask = np.zeros((seq_len))
         
         if correct_pre == correct_ori:#if model predict is wrong
-           ii += 1
-           continue
-        if true_prob ==1.0:
-            ii +=1
-            correct_noi +=1
-            continue
+            attack_attempted = False
+            status = 'skipped_clean_misclassified'
+        if np.allclose(clean_probs, 1.0):
+            attack_attempted = False
+            status = 'skipped_true_prob_one'
+            correct_noi += len(indices)
        
-        print('------------------prediction for adversarial video-------------------')
-        Test_mode = True
-        ge_time =time.time()
-        theta_in = np.ones((seq_len))*0.5
-        
-        index = ba_op(train,init_varibale_list,true_label_prob,seq_len,indicator,f,feed_dict={input_image: images[0:seq_len], input_label: labels, tau: 0.05,theta : theta_in},sess=sess)
-        
-        print(index)
-        mask = np.zeros((seq_len))
-        mask[index] =1
-        ######## without BO selection ##############
-        ###### select four frames by BO###########
-        '''
-        ind1,ind2,ind3,ind4 = ba_op_4(train,init_varibale_list,true_label_prob,seq_len,indicator,f,feed_dict={input_image: images[0:seq_len], input_label: labels, tau: 0.05},sess=sess)
-        mask = np.zeros((seq_len))
-        for i in [ind1,ind2,ind3,ind4]:
-            mask[i] = 1
-        '''
-        print(mask)
-        sess.run(tf.initialize_variables(init_varibale_list))
-        
-        
-        start_loss = var_loss1
-        if ii < 400:
-            Test_mode = False
-            for cur_iter in range(max_iter):
-                start_time = time.time()
-                tot_iter += 1
-                    
-                    
-                sess.run(train, feed_dict=feed_dict)
-                var_loss,true_prob,var_loss1, var_loss2, var_l12loss,var_pre= sess.run((loss, true_label_prob, loss1, loss2,loss2_l12, pre_label), feed_dict=feed_dict)
-                print('iter:', cur_iter, 'total loss:', var_loss, 'label loss:', var_loss1, 'content loss:', var_loss2, 'prediction:', var_pre, 'probib:', true_prob,'var_l12loss',var_l12loss)
-                
-                print('time',time.time()-start_time)
-                break_condition = False
-                if constraint == 'ssim':
-                    lo = var_loss2
-                elif constraint == 'lp':
-                    lo = var_l12loss
-                else:
-                    lo = 0
-                if lo > budget:
-                     break_condition = True
-                
-                if var_loss < min_loss:
-                    if np.absolute(var_loss-min_loss) < 0.00001:
-                        break_condition = True
-                        print(last_min)
-                        min_loss = var_loss
-                        last_min = cur_iter
-                
-                
-                if cur_iter + 1 == max_iter or break_condition:
-                    print('iter:', cur_iter,  'label loss:', var_loss1, 'content loss:', var_loss2, 'prediction:', var_pre, 'probib:', true_prob,'var_l12loss',var_l12loss)
-                    var_diff, flows_var, var_probs, noise_norm = sess.run((modifier, flows, probs, norm_frame), feed_dict=feed_dict)
-                    
-                    #for pp in range(seq_len):
-                     #print the map value for each frame
-                        #print(noise_norm[0][pp])
-                    for i in range(len(indices)):
-                        top1 = var_probs[i].argmax()
-                        if labels[i] == top1:
-                            correct_noi += 1
-                    np.save('flow_st_only.npy',flows_var)
-                    np.save('modifier_st_only.npy',var_diff)
-                    break
-                
-                    
-                
-                    
-            print('saved modifier paramters.', ii,'spend time',time.time()-start_time)
- 
-        
-       
-        ###### save images #########
-        true_im= sess.run(true_image, feed_dict=feed_dict)
-        
-     
-        for ll in range(len(indices)):
-            for kk in range(def_len):
-                if kk < seq_len:
-                    #if indicator[kk] == 1:
-                    
-                    attack_image = true_im[ll][kk]
-                        #np.reshape(angle_var,(6))
-                    
-                    attack_img = np.clip(attack_image*255.0+data_spec.mean,data_spec.rescale[0],data_spec.rescale[1])
-                        
-                    #else:
-                        #attack_img = np.clip(images[ll][kk]*255.0+var_diff[0][kk]+data_spec.mean,data_spec.rescale[0],data_spec.rescale[1])
-                   
-                    diff = np.clip(np.absolute(var_diff[0][kk])*255.0, data_spec.rescale[0],data_spec.rescale[1])
-                else:
-                   attack_img = np.clip(images[ll][kk]*255.0+data_spec.mean,data_spec.rescale[0],data_spec.rescale[1])
-                   diff = np.zeros((spec.crop_size,spec.crop_size,spec.channels))
-                im_diff = toimage(arr=diff, cmin=data_spec.rescale[0], cmax=data_spec.rescale[1])
-                im = toimage(arr=attack_img, cmin=data_spec.rescale[0], cmax=data_spec.rescale[1])
-                new_name = output_name[ll][kk].split('/')
-                
-                adv_dir = output_file_dir+'/adversarial_100/'
-                dif_dir = output_file_dir+'/noise_100/'
-                if not os.path.exists(adv_dir):
-                   os.mkdir(adv_dir)
-                   os.mkdir(dif_dir)
+        if attack_attempted:
+            print('------------------prediction for adversarial video-------------------')
+            Test_mode = True
+            ge_time =time.time()
+            theta_in = np.ones((seq_len))*0.5
 
-                tmp_dir = adv_dir+new_name[-2]
-                tmp1_dir = dif_dir+new_name[-2]
-                if not os.path.exists(tmp_dir):
-                   os.mkdir(tmp_dir)
-                   os.mkdir(tmp1_dir)
-               
-                new_name = new_name[-1] + '.png'
-                im.save(tmp_dir + '/' +new_name)
-                im_diff.save(tmp1_dir + '/' +new_name)
+            index = ba_op(train,init_varibale_list,true_label_prob,seq_len,indicator,f,feed_dict={input_image: images[0:seq_len], input_label: labels, tau: 0.05,theta : theta_in},sess=sess)
+
+            print(index)
+            mask = np.zeros((seq_len))
+            mask[index] =1
+            print(mask)
+            feed_dict.update({indicator: mask})
+            sess.run(tf.initialize_variables(init_varibale_list))
+
+            if ii < 400:
+                Test_mode = False
+                for cur_iter in range(max_iter):
+                    start_time = time.time()
+                    tot_iter += 1
+
+                    sess.run(train, feed_dict=feed_dict)
+                    var_loss,true_prob,var_loss1, var_loss2, var_l12loss,var_pre= sess.run((loss, true_label_prob, loss1, loss2,loss2_l12, pre_label), feed_dict=feed_dict)
+                    print('iter:', cur_iter, 'total loss:', var_loss, 'label loss:', var_loss1, 'content loss:', var_loss2, 'prediction:', var_pre, 'probib:', true_prob,'var_l12loss',var_l12loss)
+
+                    print('time',time.time()-start_time)
+                    break_condition = False
+                    if constraint == 'ssim':
+                        lo = var_loss2
+                    elif constraint == 'lp':
+                        lo = var_l12loss
+                    else:
+                        lo = 0
+                    if lo > budget:
+                         break_condition = True
+
+                    if var_loss < min_loss:
+                        if np.absolute(var_loss-min_loss) < 0.00001:
+                            break_condition = True
+                            print(last_min)
+                            min_loss = var_loss
+                            last_min = cur_iter
+
+                    if cur_iter + 1 == max_iter or break_condition:
+                        print('iter:', cur_iter,  'label loss:', var_loss1, 'content loss:', var_loss2, 'prediction:', var_pre, 'probib:', true_prob,'var_l12loss',var_l12loss)
+                        break
+
+            attack_time_sec = time.time() - ge_time
+            var_diff, flows_var, var_probs, noise_norm, final_var_loss2, final_var_l12loss, final_ssim = sess.run(
+                (modifier, flows, probs, norm_frame, loss2, loss2_l12, ssim_per_video), feed_dict=feed_dict)
+            adv_preds = np.argmax(var_probs, axis=1)
+
+            for i in range(len(indices)):
+                top1 = adv_preds[i]
+                if labels[i] == top1:
+                    correct_noi += 1
+
+            if single_video_mode:
+                true_im= sess.run(true_image, feed_dict=feed_dict)
+                for ll in range(len(indices)):
+                    adv_video_frames = []
+                    noise_video_frames = []
+                    for kk in range(def_len):
+                        if kk < seq_len:
+                            attack_image = true_im[ll][kk]
+                            attack_img = np.clip(attack_image*255.0+data_spec.mean,data_spec.rescale[0],data_spec.rescale[1])
+                            diff = np.clip(np.absolute(var_diff[0][kk])*255.0, data_spec.rescale[0],data_spec.rescale[1])
+                        else:
+                           attack_img = np.clip(images[ll][kk]*255.0+data_spec.mean,data_spec.rescale[0],data_spec.rescale[1])
+                           diff = np.zeros((spec.crop_size,spec.crop_size,spec.channels))
+                        im_diff = toimage(arr=diff, cmin=data_spec.rescale[0], cmax=data_spec.rescale[1])
+                        im = toimage(arr=attack_img, cmin=data_spec.rescale[0], cmax=data_spec.rescale[1])
+                        adv_video_frames.append(np.asarray(im.convert('RGB')))
+                        noise_video_frames.append(np.asarray(im_diff.convert('RGB')))
+
+                    adv_dir = output_file_dir+'/adversarial_100/'
+                    dif_dir = output_file_dir+'/noise_100/'
+                    if not os.path.exists(adv_dir):
+                        os.makedirs(adv_dir)
+                    if not os.path.exists(dif_dir):
+                        os.makedirs(dif_dir)
+
+                    video_stem = os.path.splitext(os.path.basename(names[ll]))[0]
+                    adv_path = write_video_from_rgb_frames(
+                        adv_video_frames,
+                        os.path.join(adv_dir, video_stem + '_perturbed'),
+                        output_fps)
+                    noise_path = write_video_from_rgb_frames(
+                        noise_video_frames,
+                        os.path.join(dif_dir, video_stem + '_noise'),
+                        output_fps)
+                    print('saved video outputs:', adv_path, noise_path)
+
+        for i in range(len(indices)):
+            label_i = int(labels[i])
+            clean_pred_i = int(clean_preds[i])
+            adv_pred_i = int(adv_preds[i])
+            if targets is None:
+                attack_success = bool(attack_attempted and (adv_pred_i != label_i))
+            else:
+                attack_success = bool(attack_attempted and (adv_pred_i == label_i))
+
+            if attack_attempted and var_diff is not None:
+                abs_pert = np.abs(var_diff[0])
+                mean_abs_pert = float(np.mean(abs_pert))
+                l2_pert = float(np.sqrt(np.mean(np.square(var_diff[0]))))
+                nonzero_fraction = float(np.mean(abs_pert > 1e-6))
+                ssim_value = float(final_ssim[i]) if np.ndim(final_ssim) > 0 else float(final_ssim)
+                content_loss_ssim_proxy = float(final_var_loss2)
+                content_loss_l12 = float(final_var_l12loss)
+            else:
+                mean_abs_pert = 0.0
+                l2_pert = 0.0
+                nonzero_fraction = 0.0
+                ssim_value = 1.0
+                content_loss_ssim_proxy = float(var_loss2)
+                content_loss_l12 = float(var_l12loss)
+
+            metrics_writer.writerow({
+                'video_name': names[i],
+                'label': label_i,
+                'clean_pred': clean_pred_i,
+                'adv_pred': adv_pred_i,
+                'attack_attempted': int(bool(attack_attempted)),
+                'attack_success': int(attack_success),
+                'status': status,
+                'iterations': int(tot_iter),
+                'attack_time_sec': float(attack_time_sec),
+                'selected_frames': int(np.sum(mask)),
+                'mean_abs_perturbation': mean_abs_pert,
+                'l2_perturbation': l2_pert,
+                'nonzero_fraction': nonzero_fraction,
+                'ssim_orig_vs_attacked': ssim_value,
+                'content_loss_ssim_proxy': content_loss_ssim_proxy,
+                'content_loss_l12': content_loss_l12,
+            })
+
+            agg_total_videos += 1
+            if attack_attempted:
+                agg_attacked_videos += 1
+                agg_iterations_sum += float(tot_iter)
+                agg_attack_time_sum += float(attack_time_sec)
+                agg_ssim_sum += float(ssim_value)
+                agg_mean_abs_pert_sum += float(mean_abs_pert)
+                agg_l2_pert_sum += float(l2_pert)
+                agg_nonzero_fraction_sum += float(nonzero_fraction)
+                attacked_iterations.append(float(tot_iter))
+                attacked_times.append(float(attack_time_sec))
+                attacked_ssim.append(float(ssim_value))
+                attacked_mean_abs_pert.append(float(mean_abs_pert))
+                attacked_l2_pert.append(float(l2_pert))
+                attacked_nonzero_fraction.append(float(nonzero_fraction))
+            if attack_success:
+                adv += 1
+                agg_successful_attacks += 1
   
         
         #print('saved adversarial frames.', ii,file=f)
         
         #print('correct_ori:', correct_ori, 'correct_noi:', correct_noi,'adv_examples',adv,file=f)
         print('correct_ori:', correct_ori, 'correct_noi:', correct_noi,'adv_examples',adv)
+    metrics_file.close()
+
+    if agg_attacked_videos > 0:
+        mean_iterations = agg_iterations_sum / agg_attacked_videos
+        mean_attack_time = agg_attack_time_sum / agg_attacked_videos
+        mean_ssim = agg_ssim_sum / agg_attacked_videos
+        mean_abs_perturbation = agg_mean_abs_pert_sum / agg_attacked_videos
+        mean_l2_perturbation = agg_l2_pert_sum / agg_attacked_videos
+        mean_nonzero_fraction = agg_nonzero_fraction_sum / agg_attacked_videos
+        median_iterations = float(np.median(attacked_iterations))
+        median_attack_time = float(np.median(attacked_times))
+        median_ssim = float(np.median(attacked_ssim))
+        median_abs_perturbation = float(np.median(attacked_mean_abs_pert))
+        median_l2_perturbation = float(np.median(attacked_l2_pert))
+        median_nonzero_fraction = float(np.median(attacked_nonzero_fraction))
+        std_iterations = float(np.std(attacked_iterations))
+        std_attack_time = float(np.std(attacked_times))
+        std_ssim = float(np.std(attacked_ssim))
+        std_abs_perturbation = float(np.std(attacked_mean_abs_pert))
+        std_l2_perturbation = float(np.std(attacked_l2_pert))
+        std_nonzero_fraction = float(np.std(attacked_nonzero_fraction))
+        fooling_rate = float(agg_successful_attacks) / float(agg_attacked_videos)
+    else:
+        mean_iterations = 0.0
+        mean_attack_time = 0.0
+        mean_ssim = 0.0
+        mean_abs_perturbation = 0.0
+        mean_l2_perturbation = 0.0
+        mean_nonzero_fraction = 0.0
+        median_iterations = 0.0
+        median_attack_time = 0.0
+        median_ssim = 0.0
+        median_abs_perturbation = 0.0
+        median_l2_perturbation = 0.0
+        median_nonzero_fraction = 0.0
+        std_iterations = 0.0
+        std_attack_time = 0.0
+        std_ssim = 0.0
+        std_abs_perturbation = 0.0
+        std_l2_perturbation = 0.0
+        std_nonzero_fraction = 0.0
+        fooling_rate = 0.0
+
+    summary_fields = [
+        'total_videos',
+        'attacked_videos',
+        'successful_attacks',
+        'fooling_rate',
+        'mean_iterations',
+        'mean_attack_time_sec',
+        'mean_ssim_orig_vs_attacked',
+        'mean_abs_perturbation',
+        'mean_l2_perturbation',
+        'mean_nonzero_fraction',
+        'median_iterations',
+        'median_attack_time_sec',
+        'median_ssim_orig_vs_attacked',
+        'median_abs_perturbation',
+        'median_l2_perturbation',
+        'median_nonzero_fraction',
+        'std_iterations',
+        'std_attack_time_sec',
+        'std_ssim_orig_vs_attacked',
+        'std_abs_perturbation',
+        'std_l2_perturbation',
+        'std_nonzero_fraction',
+    ]
+    summary_file = open(summary_csv_path, 'w')
+    summary_writer = csv.DictWriter(summary_file, fieldnames=summary_fields)
+    summary_writer.writeheader()
+    summary_writer.writerow({
+        'total_videos': int(agg_total_videos),
+        'attacked_videos': int(agg_attacked_videos),
+        'successful_attacks': int(agg_successful_attacks),
+        'fooling_rate': float(fooling_rate),
+        'mean_iterations': float(mean_iterations),
+        'mean_attack_time_sec': float(mean_attack_time),
+        'mean_ssim_orig_vs_attacked': float(mean_ssim),
+        'mean_abs_perturbation': float(mean_abs_perturbation),
+        'mean_l2_perturbation': float(mean_l2_perturbation),
+        'mean_nonzero_fraction': float(mean_nonzero_fraction),
+        'median_iterations': float(median_iterations),
+        'median_attack_time_sec': float(median_attack_time),
+        'median_ssim_orig_vs_attacked': float(median_ssim),
+        'median_abs_perturbation': float(median_abs_perturbation),
+        'median_l2_perturbation': float(median_l2_perturbation),
+        'median_nonzero_fraction': float(median_nonzero_fraction),
+        'std_iterations': float(std_iterations),
+        'std_attack_time_sec': float(std_attack_time),
+        'std_ssim_orig_vs_attacked': float(std_ssim),
+        'std_abs_perturbation': float(std_abs_perturbation),
+        'std_l2_perturbation': float(std_l2_perturbation),
+        'std_nonzero_fraction': float(std_nonzero_fraction),
+    })
+    summary_file.close()
+    print('saved metrics csv:', metrics_csv_path)
+    print('saved summary csv:', summary_csv_path)
 def main():
     # Parse arguments
     parser = argparse.ArgumentParser(description='Use Adam optimizer to generate adversarial examples.')
@@ -536,6 +763,10 @@ def main():
                         help='Path to a single video file (avi/mp4/mov/etc.) to test directly.')
     parser.add_argument('--video_class', type=str, default='test',
                         help='Class label to use when --video_path is provided.')
+    parser.add_argument('--output_fps', type=float, default=25.0,
+                        help='FPS used when writing output videos for --video_path mode.')
+    parser.add_argument('--metrics_csv', type=str, default=None,
+                        help='Path to CSV file for per-video attack metrics (default: <output_dir>/attack_metrics.csv).')
     parser.add_argument('--num_iter', type=int, default=100,
                         help='Number of iterations to generate attack.')
     parser.add_argument('--save_freq', type=int, default=5,
@@ -591,7 +822,10 @@ def main():
         data_spec,
         batch_size,
         total_len,
-        seq_len)
+        seq_len,
+        single_video_mode=args.video_path is not None,
+        output_fps=args.output_fps,
+        metrics_csv_path=args.metrics_csv)
     
 if __name__ == '__main__':
     main()
