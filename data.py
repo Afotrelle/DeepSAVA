@@ -31,8 +31,8 @@ class DataSet():
         self.max_frames = 300  # max number of frames a video can have for us to use it
 
         # Get the data.
-        self.data = self.get_data(data_set+data_list)
-        self.test_data = self.get_data(data_set+test_list)
+        self.data = self.get_data(self.resolve_metadata_path(data_set, data_list))
+        self.test_data = self.get_data(self.resolve_metadata_path(data_set, test_list))
 
         # Get the classes.
         self.classes = self.get_classes()
@@ -50,6 +50,35 @@ class DataSet():
             data = list(reader)
 
         return data
+
+    @staticmethod
+    def resolve_metadata_path(data_set, list_path):
+        """Resolve metadata csv paths while supporting absolute file lists.
+
+        Existing code passes dataset-relative defaults like '/video_data/test_file.csv'.
+        When a caller provides an absolute path (e.g. a temp csv), use it directly.
+        """
+        if os.path.isabs(list_path):
+            # Legacy code uses leading '/' for dataset-relative csv paths.
+            # Use absolute paths directly only when they truly exist.
+            if os.path.exists(list_path):
+                return list_path
+
+            normalized = list_path.lstrip('/\\')
+            dataset_relative = os.path.join(data_set, normalized)
+            if os.path.exists(dataset_relative):
+                return dataset_relative
+
+            # Fall back to the provided absolute path for clearer downstream errors.
+            return list_path
+
+        # Allow callers to pass a path that already exists from current cwd.
+        if os.path.exists(list_path):
+            return list_path
+
+        # Backward-compatible behavior for legacy defaults starting with '/'.
+        normalized = list_path.lstrip('/\\')
+        return os.path.join(data_set, normalized)
 
     def clean_data(self):
         """Limit samples to greater than the sequence length and fewer
@@ -218,7 +247,8 @@ class DataSet():
         temp_dir = tempfile.mkdtemp(prefix='deepsava_frames_', dir=os.getcwd())
         frame_paths = []
         frame_index = 0
-        base_name = video_name or os.path.splitext(os.path.basename(video_path))[0]
+        source_name = video_name or video_path
+        base_name = os.path.splitext(os.path.basename(source_name))[0]
 
         while True:
             ok, frame = cap.read()
@@ -230,7 +260,7 @@ class DataSet():
                 frame_paths.append(frame_path)
 
         cap.release()
-        return frame_paths, video_name or os.path.basename(video_path)
+        return frame_paths, os.path.basename(source_name)
 
     @staticmethod
     def get_frames_for_sample(data_set,sample):
@@ -257,7 +287,7 @@ class DataSet():
 
         for candidate in video_candidates:
             if DataSet.is_video_file(candidate):
-                return DataSet.extract_frames_from_video(candidate, candidate)
+                return DataSet.extract_frames_from_video(candidate, video_name)
 
         if video_name and os.path.isdir(video_name):
             images = sorted(glob.glob(os.path.join(video_name, '*.jpg')))

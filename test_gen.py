@@ -13,7 +13,8 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"]='2'
 import cv2
 import numpy as np
 from PIL import Image
-from ssim import SSIM
+# The legacy ssim package is intentionally not installed or imported here.
+# SSIM-based experiments in this repo use TensorFlow's built-in SSIM instead.
 import time
 from stn import spatial_transformer_network as transformer
 _errstr = "Mode is unknown or incompatible with input array shape."
@@ -434,7 +435,7 @@ def calc_gradients(
                 if constraint == 'ssim':
                     lo = var_loss2
                 elif constraint == 'lp':
-                    lo = var_losslp
+                    lo = var_l12loss
                 else:
                     lo = 0
                 if lo > budget:
@@ -519,7 +520,7 @@ def calc_gradients(
 def main():
     # Parse arguments
     parser = argparse.ArgumentParser(description='Use Adam optimizer to generate adversarial examples.')
-    parser.add_argument('-i', '--input_dir', type=str, required=True,
+    parser.add_argument('-i', '--input_dir', type=str, default=None,
                         help='Directory of dataset.')
     parser.add_argument('-o', '--output_dir', type=str, required=True,
                         help='Directory of output image file.')

@@ -1,7 +1,7 @@
 import tensorflow as tf
 import numpy as np
-from scikit_opt.sko.GA import GA
-from scikit_opt.sko.SA import SA_TSP
+from sko.GA import GA
+from sko.SA import SA_TSP
 from bayes_opt import BayesianOptimization
 import random
 def initRandom(constraint):
