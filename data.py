@@ -6,7 +6,6 @@ import numpy as np
 import random
 import glob
 import os
-import tempfile
 import pandas as pd
 import sys
 import operator
@@ -25,6 +24,10 @@ class DataSet():
         class_limit = (int) number of classes to limit the data to.
             None = no limit.
         """
+        self.data_set = data_set  # needed so data.py's own internal callers
+                                   # (get_all_sequences_in_memory, frame_generator)
+                                   # can call get_frames_for_sample(self.data_set, ...)
+                                   # the same way test_gen.py does.
         self.seq_length = seq_length
         self.class_limit = class_limit
         self.sequence_path = sequence_path
@@ -59,8 +62,6 @@ class DataSet():
         When a caller provides an absolute path (e.g. a temp csv), use it directly.
         """
         if os.path.isabs(list_path):
-            # Legacy code uses leading '/' for dataset-relative csv paths.
-            # Use absolute paths directly only when they truly exist.
             if os.path.exists(list_path):
                 return list_path
 
@@ -69,14 +70,11 @@ class DataSet():
             if os.path.exists(dataset_relative):
                 return dataset_relative
 
-            # Fall back to the provided absolute path for clearer downstream errors.
             return list_path
 
-        # Allow callers to pass a path that already exists from current cwd.
         if os.path.exists(list_path):
             return list_path
 
-        # Backward-compatible behavior for legacy defaults starting with '/'.
         normalized = list_path.lstrip('/\\')
         return os.path.join(data_set, normalized)
 
@@ -99,10 +97,8 @@ class DataSet():
             if item[1] not in classes:
                 classes.append(item[1])
 
-        # Sort them.
         classes = sorted(classes)
 
-        # Return.
         if self.class_limit is not None:
             return classes[:self.class_limit]
         else:
@@ -111,11 +107,8 @@ class DataSet():
     def get_class_one_hot(self, class_str):
         """Given a class as a string, return its number in the classes
         list. This lets us encode and one-hot it for training."""
-        # Encode it first.
         label_encoded = self.classes.index(class_str)
-        # Now one-hot it
         label_hot = tf.one_hot(label_encoded, len(self.classes))
-#        label_hot = label_hot[0]  # just get a single row
 
         return label_encoded, label_hot
 
@@ -135,7 +128,6 @@ class DataSet():
         This is a mirror of our generator, but attempts to load everything into
         memory so we can train way faster.
         """
-        # Get the right dataset.
         train, test = self.split_train_test()
         data = train if train_test == 'train' else test
 
@@ -145,10 +137,13 @@ class DataSet():
         for row in data:
 
             if data_type == 'images':
-                frames = self.get_frames_for_sample(row)
+                # FIX: was self.get_frames_for_sample(row) — missing the
+                # data_set arg and not unpacking the (frames, name) tuple
+                # get_frames_for_sample actually returns (see test_gen.py
+                # line ~365 for the call signature it must match).
+                frames, _ = self.get_frames_for_sample(self.data_set, row, max_frames=self.seq_length)
                 frames = self.rescale_list(frames, self.seq_length)
 
-                # Build the image sequence
                 sequence = self.build_image_sequence(frames)
 
             else:
@@ -159,8 +154,6 @@ class DataSet():
                     raise
 
                 if concat:
-                    # We want to pass the sequence back as a single array. This
-                    # is used to pass into a CNN or MLP, rather than an RNN.
                     sequence = np.concatenate(sequence).ravel()
 
             X.append(sequence)
@@ -174,7 +167,6 @@ class DataSet():
 
         data_type: 'features', 'images'
         """
-        # Get the right dataset for the generator.
         train, test = self.split_train_test()
         data = train if train_test == 'train' else test
 
@@ -183,23 +175,17 @@ class DataSet():
         while 1:
             X, y = [], []
 
-            # Generate batch_size samples.
             for _ in range(batch_size):
-                # Reset to be safe.
                 sequence = None
 
-                # Get a random sample.
                 sample = random.choice(data)
-                # Check to see if we've already saved this sequence.
-                if data_type is "images":
-                    # Get and resample frames.
-                    frames = self.get_frames_for_sample(sample)
+                if data_type == "images":
+                    # FIX: same call-signature bug as above.
+                    frames, _ = self.get_frames_for_sample(self.data_set, sample, max_frames=self.seq_length)
                     frames = self.rescale_list(frames, self.seq_length)
 
-                    # Build the image sequence
                     sequence = self.build_image_sequence(frames)
                 else:
-                    # Get the sequence from disk.
                     sequence = self.get_extracted_sequence(data_type, sample)
 
                 if sequence is None:
@@ -207,8 +193,6 @@ class DataSet():
                     sys.exit()  # TODO this should raise
 
                 if concat:
-                    # We want to pass the sequence back as a single array. This
-                    # is used to pass into an MLP rather than an RNN.
                     sequence = np.concatenate(sequence).ravel()
 
                 X.append(sequence)
@@ -217,16 +201,47 @@ class DataSet():
             yield np.array(X), np.array(y)
 
     def build_image_sequence(self, frames):
-        """Given a set of frames (filenames), build our sequence."""
+        """Given a set of frames, build our sequence.
+
+        `frames` can be either:
+          - a list of jpg file paths (legacy pre-extracted-frame datasets), or
+          - a list of raw decoded numpy arrays (frames pulled straight out of
+            a video file with no disk round-trip).
+
+        We dispatch on the element type so both dataset layouts keep working
+        through the same code path.
+        """
+        if len(frames) > 0 and isinstance(frames[0], np.ndarray):
+            return [self.process_video_frame(f, self.image_shape) for f in frames]
         return [process_image(x, self.image_shape) for x in frames]
- 
+
+    @staticmethod
+    def process_video_frame(frame, shape):
+        """Process a raw BGR frame (as decoded by OpenCV) directly into the
+        tensor format the model expects, in memory — no jpg write/read.
+
+        Mirrors processor.process_image, which does:
+            load_img(image, target_size=(h, w))   # PIL, RGB, interpolation='nearest'
+            img_to_array(image)
+            img_arr / 255.
+        So here: BGR->RGB, resize with nearest-neighbor (Keras load_img's
+        default interpolation — using cv2.INTER_AREA/INTER_LINEAR instead
+        would give subtly different pixel values, which matters when you're
+        measuring perturbation magnitude), then scale to [0, 1] float32.
+        No mean subtraction, matching process_image.
+        """
+        h, w = shape[0], shape[1]
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_NEAREST)
+        frame = frame.astype(np.float32) / 255.0
+        return frame
+
     def get_extracted_sequence(self, data_type, sample):
         """Get the saved extracted features."""
         filename = sample[2]
         path = self.sequence_path + filename + '-' + str(self.seq_length) + \
             '-' + data_type + '.txt'
         if os.path.isfile(path):
-            # Use a dataframe/read_csv for speed increase over numpy.
             features = pd.read_csv(path, sep=" ", header=None)
             return features.values
         else:
@@ -239,62 +254,66 @@ class DataSet():
 
     @staticmethod
     def extract_frames_from_video(video_path, video_name=None, max_frames=None):
-        """Extract frames from a video file into temporary JPEG files.
+        """Decode frames from a video file directly into memory as numpy
+        arrays — no temp jpg files, no disk round-trip.
 
         If max_frames is given and the video's total frame count can be
         determined reliably, only ~max_frames evenly spaced frames are
-        decoded and written to disk (matching the sampling later performed by
-        rescale_list()). This avoids decoding and writing every single frame
-        of long videos when only a handful are ultimately used, which is a
-        major I/O bottleneck on network-backed storage for long videos.
+        decoded (matching the sampling previously done post-hoc by
+        rescale_list()), so we don't decode frames we're going to throw away.
+
+        Returns (frames, name):
+          - frames: a list of raw BGR numpy arrays (not yet color-converted,
+            resized, or normalized — that happens later in
+            build_image_sequence / process_video_frame).
+          - name: matches the (frames, f_name) tuple shape get_frames_for_sample
+            has always returned, since test_gen.py unpacks it that way.
         """
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise ValueError('Could not open video file: %s' % video_path)
 
-        temp_dir = tempfile.mkdtemp(prefix='deepsava_frames_', dir=os.getcwd())
-        frame_paths = []
+        frames = []
         source_name = video_name or video_path
-        base_name = os.path.splitext(os.path.basename(source_name))[0]
-
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
         if max_frames and total_frames >= max_frames:
             skip = total_frames // max_frames
             target_indices = list(range(0, total_frames, skip))[:max_frames]
-            for order, frame_idx in enumerate(target_indices, start=1):
+            for frame_idx in target_indices:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
                 ok, frame = cap.read()
                 if not ok:
                     continue
-                frame_path = os.path.join(temp_dir, '%s_%05d.jpg' % (base_name, order))
-                if cv2.imwrite(frame_path, frame):
-                    frame_paths.append(frame_path)
+                frames.append(frame)
         else:
-            # Fall back to decoding every frame sequentially when the total
-            # frame count is unknown/unreliable or the video is already
-            # shorter than max_frames.
-            frame_index = 0
+            # Total frame count unknown/unreliable, or video already shorter
+            # than max_frames — decode sequentially and keep everything.
             while True:
                 ok, frame = cap.read()
                 if not ok:
                     break
-                frame_index += 1
-                frame_path = os.path.join(temp_dir, '%s_%05d.jpg' % (base_name, frame_index))
-                if cv2.imwrite(frame_path, frame):
-                    frame_paths.append(frame_path)
+                frames.append(frame)
 
         cap.release()
-        return frame_paths, os.path.basename(source_name)
+        return frames, os.path.basename(source_name)
 
     @staticmethod
-    def get_frames_for_sample(data_set,sample,max_frames=None):
-        """Given a sample row from the data file, get all the corresponding frame
-        filenames. Supports either pre-extracted JPG frames or direct video files.
+    def get_frames_for_sample(data_set, sample, max_frames=None):
+        """Given a sample row from the data file, get all the corresponding
+        frames. Supports either pre-extracted JPG frames (returns file paths)
+        or direct video files (returns decoded numpy arrays, extracted
+        straight to memory — no jpg round-trip).
 
-        max_frames, when given, is forwarded to extract_frames_from_video() to
-        avoid decoding/writing every frame of long videos when only a subset
-        (e.g. seq_length) will actually be used."""
+        Kept as a staticmethod taking `data_set` explicitly, and returning a
+        (frames, name) tuple, because that's the exact call signature
+        test_gen.py uses directly:
+            frames, f_name = data.get_frames_for_sample(data_set_name, video, max_frames=def_len)
+
+        max_frames, when given, is forwarded to extract_frames_from_video()
+        so long videos aren't fully decoded when only a subset (e.g.
+        seq_length) will actually be used.
+        """
         if len(sample) < 3:
             return [], None
 
@@ -329,7 +348,7 @@ class DataSet():
         else:
             path = data_set+'/video_data/' + sample[0] + '/' + sample[1] + '/'+sample[2]+'/'
             images = sorted(glob.glob(path  + '*.jpg'))
-        return images,sample[2]
+        return images, sample[2]
 
     @staticmethod
     def get_filename_from_image(filename):
@@ -343,32 +362,23 @@ class DataSet():
         list of size five which is every 5th element of the origina list."""
         assert len(input_list) >= size
 
-        # Get the number to skip between iterations.
         skip = len(input_list) // size
-        
-        #output = [input_list[i] for i in range(0, size*2, 2)] 
-        # Build our new output.
         output = [input_list[i] for i in range(0, len(input_list), skip)]
 
-        # Cut off the last one if needed.
         return output[:size]
 
-    @staticmethod
-    def print_class_from_prediction(predictions, nb_to_return=5):
+    def print_class_from_prediction(self, predictions, nb_to_return=5):
         """Given a prediction, print the top classes."""
-        # Get the prediction for each label.
         label_predictions = {}
-        for i, label in enumerate(data.classes):
+        for i, label in enumerate(self.classes):
             label_predictions[label] = predictions[i]
 
-        # Now sort them.
         sorted_lps = sorted(
             label_predictions.items(),
             key=operator.itemgetter(1),
             reverse=True
         )
 
-        # And return the top N.
         for i, class_prediction in enumerate(sorted_lps):
             if i > nb_to_return - 1 or class_prediction[1] == 0.0:
                 break
