@@ -7,7 +7,7 @@ import i3d
 # Add the kaffe module to the import path
 sys.path.append(osp.realpath(osp.join(osp.dirname(__file__), './')))
 from tensorflow.python.keras.backend import set_session
-from inception.inception import inception_model
+# from inception.inception import inception_model
 
 from tensorflow.keras.applications.inception_v3 import InceptionV3, preprocess_input
 
