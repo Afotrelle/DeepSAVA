@@ -362,7 +362,7 @@ def calc_gradients(
     print('extracting frames for %d videos...' % total_videos_to_extract)
     for extract_idx, video in enumerate(data.test_data):
         extract_start = time.time()
-        frames,f_name = data.get_frames_for_sample(data_set_name,video)
+        frames,f_name = data.get_frames_for_sample(data_set_name,video,max_frames=def_len)
         print('[%d/%d] %s: %d frames extracted in %.1fs' % (
             extract_idx + 1, total_videos_to_extract, f_name, len(frames), time.time() - extract_start))
         if len(frames) < def_len:

@@ -238,34 +238,63 @@ class DataSet():
         return isinstance(path, str) and os.path.isfile(path) and os.path.splitext(path)[1].lower() in VIDEO_EXTENSIONS
 
     @staticmethod
-    def extract_frames_from_video(video_path, video_name=None):
-        """Extract frames from a video file into temporary JPEG files."""
+    def extract_frames_from_video(video_path, video_name=None, max_frames=None):
+        """Extract frames from a video file into temporary JPEG files.
+
+        If max_frames is given and the video's total frame count can be
+        determined reliably, only ~max_frames evenly spaced frames are
+        decoded and written to disk (matching the sampling later performed by
+        rescale_list()). This avoids decoding and writing every single frame
+        of long videos when only a handful are ultimately used, which is a
+        major I/O bottleneck on network-backed storage for long videos.
+        """
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise ValueError('Could not open video file: %s' % video_path)
 
         temp_dir = tempfile.mkdtemp(prefix='deepsava_frames_', dir=os.getcwd())
         frame_paths = []
-        frame_index = 0
         source_name = video_name or video_path
         base_name = os.path.splitext(os.path.basename(source_name))[0]
 
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            frame_index += 1
-            frame_path = os.path.join(temp_dir, '%s_%05d.jpg' % (base_name, frame_index))
-            if cv2.imwrite(frame_path, frame):
-                frame_paths.append(frame_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+        if max_frames and total_frames >= max_frames:
+            skip = total_frames // max_frames
+            target_indices = list(range(0, total_frames, skip))[:max_frames]
+            for order, frame_idx in enumerate(target_indices, start=1):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                ok, frame = cap.read()
+                if not ok:
+                    continue
+                frame_path = os.path.join(temp_dir, '%s_%05d.jpg' % (base_name, order))
+                if cv2.imwrite(frame_path, frame):
+                    frame_paths.append(frame_path)
+        else:
+            # Fall back to decoding every frame sequentially when the total
+            # frame count is unknown/unreliable or the video is already
+            # shorter than max_frames.
+            frame_index = 0
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                frame_index += 1
+                frame_path = os.path.join(temp_dir, '%s_%05d.jpg' % (base_name, frame_index))
+                if cv2.imwrite(frame_path, frame):
+                    frame_paths.append(frame_path)
 
         cap.release()
         return frame_paths, os.path.basename(source_name)
 
     @staticmethod
-    def get_frames_for_sample(data_set,sample):
+    def get_frames_for_sample(data_set,sample,max_frames=None):
         """Given a sample row from the data file, get all the corresponding frame
-        filenames. Supports either pre-extracted JPG frames or direct video files."""
+        filenames. Supports either pre-extracted JPG frames or direct video files.
+
+        max_frames, when given, is forwarded to extract_frames_from_video() to
+        avoid decoding/writing every frame of long videos when only a subset
+        (e.g. seq_length) will actually be used."""
         if len(sample) < 3:
             return [], None
 
@@ -287,7 +316,7 @@ class DataSet():
 
         for candidate in video_candidates:
             if DataSet.is_video_file(candidate):
-                return DataSet.extract_frames_from_video(candidate, video_name)
+                return DataSet.extract_frames_from_video(candidate, video_name, max_frames=max_frames)
 
         if video_name and os.path.isdir(video_name):
             images = sorted(glob.glob(os.path.join(video_name, '*.jpg')))
