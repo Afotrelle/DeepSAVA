@@ -358,8 +358,13 @@ def calc_gradients(
     all_labels = []
     output_names = []
     def_len = seq_len
-    for video in data.test_data:
+    total_videos_to_extract = len(data.test_data)
+    print('extracting frames for %d videos...' % total_videos_to_extract)
+    for extract_idx, video in enumerate(data.test_data):
+        extract_start = time.time()
         frames,f_name = data.get_frames_for_sample(data_set_name,video)
+        print('[%d/%d] %s: %d frames extracted in %.1fs' % (
+            extract_idx + 1, total_videos_to_extract, f_name, len(frames), time.time() - extract_start))
         if len(frames) < def_len:
            continue
         frames = data.rescale_list(frames, def_len)
@@ -373,6 +378,7 @@ def calc_gradients(
     all_indices = range(total)
     num_batch = int(total/batch_size)
     f = open("rotate_ssim_hcm.txt", "a+")
+    print('process data length:', num_batch)
     print('process data length:', num_batch,file=f)
 
     if not os.path.exists(output_file_dir):
@@ -593,7 +599,17 @@ def calc_gradients(
                 mean_abs_pert = float(np.mean(abs_pert))
                 l2_pert = float(np.sqrt(np.mean(np.square(var_diff[0]))))
                 nonzero_fraction = float(np.mean(abs_pert > 1e-6))
-                ssim_value = float(final_ssim[i]) if np.ndim(final_ssim) > 0 else float(final_ssim)
+                # final_ssim has shape (batch_size, seq_len) (one SSIM score per
+                # frame per video), since ssim_multiscale treats all leading
+                # dims besides H/W/C as batch dims. Average over frames to get
+                # a single video-level SSIM score.
+                final_ssim_arr = np.asarray(final_ssim)
+                if final_ssim_arr.ndim > 1:
+                    ssim_value = float(np.mean(final_ssim_arr[i]))
+                elif final_ssim_arr.ndim == 1:
+                    ssim_value = float(final_ssim_arr[i])
+                else:
+                    ssim_value = float(final_ssim_arr)
                 content_loss_ssim_proxy = float(final_var_loss2)
                 content_loss_l12 = float(final_var_l12loss)
             else:
