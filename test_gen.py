@@ -257,7 +257,7 @@ def calc_gradients(
         class_no = 51
     #initial_T =  np.array([[0.1255,0.5642,20],[1.0041,0,10],[0,0,1]])
     modifier = tf.Variable(0.01*np.ones((1, seq_len, spec.crop_size,spec.crop_size,spec.channels),dtype=np.float32))
-    blur_para = tf.Variable(0.01*np.ones((1, seq_len, spec.crop_size,spec.crop_size,spec.channels),dtype=np.float32))
+    # blur_para = tf.Variable(0.01*np.ones((1, seq_len, spec.crop_size,spec.crop_size,spec.channels),dtype=np.float32))
     # identity transform
    
     input_image = tf.placeholder(tf.float32, (batch_size, total_len, spec.crop_size, spec.crop_size, spec.channels))
@@ -760,6 +760,7 @@ def calc_gradients(
     summary_file.close()
     print('saved metrics csv:', metrics_csv_path)
     print('saved summary csv:', summary_csv_path)
+
 def main():
     # Parse arguments
     parser = argparse.ArgumentParser(description='Use Adam optimizer to generate adversarial examples.')
