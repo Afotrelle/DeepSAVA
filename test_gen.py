@@ -257,7 +257,7 @@ def calc_gradients(
         class_no = 51
     #initial_T =  np.array([[0.1255,0.5642,20],[1.0041,0,10],[0,0,1]])
     modifier = tf.Variable(0.01*np.ones((1, seq_len, spec.crop_size,spec.crop_size,spec.channels),dtype=np.float32))
-    # blur_para = tf.Variable(0.01*np.ones((1, seq_len, spec.crop_size,spec.crop_size,spec.channels),dtype=np.float32))
+    blur_para = tf.Variable(0.01*np.ones((1, seq_len, spec.crop_size,spec.crop_size,spec.channels),dtype=np.float32))
     # identity transform
    
     input_image = tf.placeholder(tf.float32, (batch_size, total_len, spec.crop_size, spec.crop_size, spec.channels))
@@ -348,8 +348,16 @@ def calc_gradients(
     Train = optimizer.minimize(loss1, var_list=[modifier,flows])
     # initiallize all uninitialized varibales
     init_varibale_list = set(tf.all_variables()) - variable_set
-    
-    sess.run(tf.initialize_variables(init_varibale_list))
+
+    # Build the reinitializer op ONCE. tf.initialize_variables(...)/
+    # tf.variables_initializer(...) constructs brand new graph ops every time
+    # it's called - calling it inside the per-video loop (and inside ba_op's
+    # per-BayesianOptimization-iteration loop) was silently growing the graph
+    # forever, which is what was causing the OOM around video ~12: it's not a
+    # fixed per-video memory cost, it accumulates with every video processed.
+    reinit_op = tf.variables_initializer(list(init_varibale_list))
+
+    sess.run(reinit_op)
 
     data = DataSet(data_set=data_set_name,test_list=test_file, seq_length=seq_len,image_shape=(spec.crop_size, spec.crop_size, spec.channels))
     print('data loaded')
@@ -430,7 +438,7 @@ def calc_gradients(
     correct_noi = 0
     tot_image = 0
     adv = 0
-    sess.run(tf.initialize_variables(init_varibale_list))
+    sess.run(reinit_op)
     for ii in range(num_batch):
         images = all_images[ii*batch_size : (ii+1)*batch_size]
         names = all_names[ii*batch_size : (ii+1)*batch_size]
@@ -443,8 +451,8 @@ def calc_gradients(
         for xx in range(len(indices)):
             print(names[xx],'label:', labels[xx], 'indice:',indices[xx], 'size:', len(images[xx]), len(images[xx][0]), len(images[xx][0][0]), len(images[xx][0][0][0]))
         
-        sess.run(tf.initialize_variables(init_varibale_list))
-        
+        sess.run(reinit_op)
+
         if targets is not None:
             labels = [targets[e] for e in names]
         
@@ -498,14 +506,14 @@ def calc_gradients(
             ge_time =time.time()
             theta_in = np.ones((seq_len))*0.5
 
-            index = ba_op(train,init_varibale_list,true_label_prob,seq_len,indicator,f,feed_dict={input_image: images[0:seq_len], input_label: labels, tau: 0.05,theta : theta_in},sess=sess)
+            index = ba_op(train,reinit_op,true_label_prob,seq_len,indicator,f,feed_dict={input_image: images[0:seq_len], input_label: labels, tau: 0.05,theta : theta_in},sess=sess)
 
             print(index)
             mask = np.zeros((seq_len))
             mask[index] =1
             print(mask)
             feed_dict.update({indicator: mask})
-            sess.run(tf.initialize_variables(init_varibale_list))
+            sess.run(reinit_op)
 
             if ii < 400:
                 Test_mode = False
@@ -760,7 +768,6 @@ def calc_gradients(
     summary_file.close()
     print('saved metrics csv:', metrics_csv_path)
     print('saved summary csv:', summary_csv_path)
-
 def main():
     # Parse arguments
     parser = argparse.ArgumentParser(description='Use Adam optimizer to generate adversarial examples.')
@@ -846,4 +853,3 @@ def main():
     
 if __name__ == '__main__':
     main()
-

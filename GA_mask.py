@@ -377,9 +377,19 @@ def sa_tsp(
         'loss': best_distance
     }
 def ba_op(
-     train,init_varibale_list,true_label_prob,seq_len, indicator,f,feed_dict=None,
+     train,reinit_op,true_label_prob,seq_len, indicator,f,feed_dict=None,
     bo_extra_kwargs=None, sess=None):
-    
+    # NOTE: this parameter used to be `init_varibale_list`, and tf_run() below
+    # called tf.initialize_variables(init_varibale_list) on every evaluation.
+    # BayesianOptimization.maximize(init_points=10, n_iter=10) calls tf_run 20
+    # times per ba_op() call (i.e. per video), and tf.initialize_variables(...)
+    # builds brand new graph ops each time it's invoked rather than reusing
+    # anything - so every video permanently grew the graph by 20 more sets of
+    # init/assign ops for `modifier`/`flows`, which is what was causing GPU
+    # memory to climb until it OOM'd after a dozen or so videos. Now the caller
+    # builds the initializer op once (tf.variables_initializer(...)) and just
+    # passes that same op in here to be re-run.
+
     def tf_run(x):
         """Function to minimize as provided to ``scipy.optimize.fmin_l_bfgs_b``.
         Args:
@@ -395,7 +405,7 @@ def ba_op(
         ind = np.zeros((seq_len))
         ind[x] = 1
         feed_dict.update({indicator: ind})
-        sess_.run(tf.initialize_variables(init_varibale_list))
+        sess_.run(reinit_op)
         sess_.run(train, feed_dict=feed_dict)
         prob = sess_.run(
             [true_label_prob], feed_dict=feed_dict
@@ -442,8 +452,10 @@ def ba_op(
     
     return index
 def ba_op_4(
-  train,init_varibale_list,true_label_prob,seq_len, indicator,f,feed_dict=None,
+  train,reinit_op,true_label_prob,seq_len, indicator,f,feed_dict=None,
  bo_extra_kwargs=None, sess=None):
+ # Same fix as ba_op: takes a pre-built tf.variables_initializer(...) op
+ # instead of rebuilding init ops on every tf_run evaluation.
 
  def tf_run(x1,x2,x3,x4):
      """Function to minimize as provided to ``scipy.optimize.fmin_l_bfgs_b``.
@@ -462,7 +474,7 @@ def ba_op_4(
         i = int(np.around(x))
         ind[i] = 1
      feed_dict.update({indicator: ind})
-     sess_.run(tf.initialize_variables(init_varibale_list))
+     sess_.run(reinit_op)
      sess_.run(train, feed_dict=feed_dict)
      prob = sess_.run(
          [true_label_prob], feed_dict=feed_dict
