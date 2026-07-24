@@ -406,6 +406,8 @@ def calc_gradients(
         'status',
         'iterations',
         'attack_time_sec',
+        'bo_time_sec',
+        'perturbation_time_sec',
         'selected_frames',
         'mean_abs_perturbation',
         'l2_perturbation',
@@ -423,12 +425,16 @@ def calc_gradients(
     agg_successful_attacks = 0
     agg_iterations_sum = 0.0
     agg_attack_time_sum = 0.0
+    agg_bo_time_sum = 0.0
+    agg_perturbation_time_sum = 0.0
     agg_ssim_sum = 0.0
     agg_mean_abs_pert_sum = 0.0
     agg_l2_pert_sum = 0.0
     agg_nonzero_fraction_sum = 0.0
     attacked_iterations = []
     attacked_times = []
+    attacked_bo_times = []
+    attacked_perturbation_times = []
     attacked_ssim = []
     attacked_mean_abs_pert = []
     attacked_l2_pert = []
@@ -483,6 +489,8 @@ def calc_gradients(
         status = 'attacked'
         attack_success = False
         attack_time_sec = 0.0
+        bo_time_sec = 0.0
+        perturbation_time_sec = 0.0
         var_diff = None
         var_probs = None
         noise_norm = None
@@ -506,7 +514,9 @@ def calc_gradients(
             ge_time =time.time()
             theta_in = np.ones((seq_len))*0.5
 
+            bo_start_time = time.time()
             index = ba_op(train,reinit_op,true_label_prob,seq_len,indicator,f,feed_dict={input_image: images[0:seq_len], input_label: labels, tau: 0.05,theta : theta_in},sess=sess)
+            bo_time_sec = time.time() - bo_start_time
 
             print(index)
             mask = np.zeros((seq_len))
@@ -515,6 +525,7 @@ def calc_gradients(
             feed_dict.update({indicator: mask})
             sess.run(reinit_op)
 
+            perturbation_start_time = time.time()
             if ii < 400:
                 Test_mode = False
                 for cur_iter in range(max_iter):
@@ -547,6 +558,7 @@ def calc_gradients(
                         print('iter:', cur_iter,  'label loss:', var_loss1, 'content loss:', var_loss2, 'prediction:', var_pre, 'probib:', true_prob,'var_l12loss',var_l12loss)
                         break
 
+            perturbation_time_sec = time.time() - perturbation_start_time
             attack_time_sec = time.time() - ge_time
             var_diff, flows_var, var_probs, noise_norm, final_var_loss2, final_var_l12loss, final_ssim = sess.run(
                 (modifier, flows, probs, norm_frame, loss2, loss2_l12, ssim_per_video), feed_dict=feed_dict)
@@ -638,6 +650,8 @@ def calc_gradients(
                 'status': status,
                 'iterations': int(tot_iter),
                 'attack_time_sec': float(attack_time_sec),
+                'bo_time_sec': float(bo_time_sec),
+                'perturbation_time_sec': float(perturbation_time_sec),
                 'selected_frames': int(np.sum(mask)),
                 'mean_abs_perturbation': mean_abs_pert,
                 'l2_perturbation': l2_pert,
@@ -652,12 +666,16 @@ def calc_gradients(
                 agg_attacked_videos += 1
                 agg_iterations_sum += float(tot_iter)
                 agg_attack_time_sum += float(attack_time_sec)
+                agg_bo_time_sum += float(bo_time_sec)
+                agg_perturbation_time_sum += float(perturbation_time_sec)
                 agg_ssim_sum += float(ssim_value)
                 agg_mean_abs_pert_sum += float(mean_abs_pert)
                 agg_l2_pert_sum += float(l2_pert)
                 agg_nonzero_fraction_sum += float(nonzero_fraction)
                 attacked_iterations.append(float(tot_iter))
                 attacked_times.append(float(attack_time_sec))
+                attacked_bo_times.append(float(bo_time_sec))
+                attacked_perturbation_times.append(float(perturbation_time_sec))
                 attacked_ssim.append(float(ssim_value))
                 attacked_mean_abs_pert.append(float(mean_abs_pert))
                 attacked_l2_pert.append(float(l2_pert))
@@ -676,18 +694,24 @@ def calc_gradients(
     if agg_attacked_videos > 0:
         mean_iterations = agg_iterations_sum / agg_attacked_videos
         mean_attack_time = agg_attack_time_sum / agg_attacked_videos
+        mean_bo_time = agg_bo_time_sum / agg_attacked_videos
+        mean_perturbation_time = agg_perturbation_time_sum / agg_attacked_videos
         mean_ssim = agg_ssim_sum / agg_attacked_videos
         mean_abs_perturbation = agg_mean_abs_pert_sum / agg_attacked_videos
         mean_l2_perturbation = agg_l2_pert_sum / agg_attacked_videos
         mean_nonzero_fraction = agg_nonzero_fraction_sum / agg_attacked_videos
         median_iterations = float(np.median(attacked_iterations))
         median_attack_time = float(np.median(attacked_times))
+        median_bo_time = float(np.median(attacked_bo_times))
+        median_perturbation_time = float(np.median(attacked_perturbation_times))
         median_ssim = float(np.median(attacked_ssim))
         median_abs_perturbation = float(np.median(attacked_mean_abs_pert))
         median_l2_perturbation = float(np.median(attacked_l2_pert))
         median_nonzero_fraction = float(np.median(attacked_nonzero_fraction))
         std_iterations = float(np.std(attacked_iterations))
         std_attack_time = float(np.std(attacked_times))
+        std_bo_time = float(np.std(attacked_bo_times))
+        std_perturbation_time = float(np.std(attacked_perturbation_times))
         std_ssim = float(np.std(attacked_ssim))
         std_abs_perturbation = float(np.std(attacked_mean_abs_pert))
         std_l2_perturbation = float(np.std(attacked_l2_pert))
@@ -696,18 +720,24 @@ def calc_gradients(
     else:
         mean_iterations = 0.0
         mean_attack_time = 0.0
+        mean_bo_time = 0.0
+        mean_perturbation_time = 0.0
         mean_ssim = 0.0
         mean_abs_perturbation = 0.0
         mean_l2_perturbation = 0.0
         mean_nonzero_fraction = 0.0
         median_iterations = 0.0
         median_attack_time = 0.0
+        median_bo_time = 0.0
+        median_perturbation_time = 0.0
         median_ssim = 0.0
         median_abs_perturbation = 0.0
         median_l2_perturbation = 0.0
         median_nonzero_fraction = 0.0
         std_iterations = 0.0
         std_attack_time = 0.0
+        std_bo_time = 0.0
+        std_perturbation_time = 0.0
         std_ssim = 0.0
         std_abs_perturbation = 0.0
         std_l2_perturbation = 0.0
@@ -721,18 +751,24 @@ def calc_gradients(
         'fooling_rate',
         'mean_iterations',
         'mean_attack_time_sec',
+        'mean_bo_time_sec',
+        'mean_perturbation_time_sec',
         'mean_ssim_orig_vs_attacked',
         'mean_abs_perturbation',
         'mean_l2_perturbation',
         'mean_nonzero_fraction',
         'median_iterations',
         'median_attack_time_sec',
+        'median_bo_time_sec',
+        'median_perturbation_time_sec',
         'median_ssim_orig_vs_attacked',
         'median_abs_perturbation',
         'median_l2_perturbation',
         'median_nonzero_fraction',
         'std_iterations',
         'std_attack_time_sec',
+        'std_bo_time_sec',
+        'std_perturbation_time_sec',
         'std_ssim_orig_vs_attacked',
         'std_abs_perturbation',
         'std_l2_perturbation',
@@ -748,18 +784,24 @@ def calc_gradients(
         'fooling_rate': float(fooling_rate),
         'mean_iterations': float(mean_iterations),
         'mean_attack_time_sec': float(mean_attack_time),
+        'mean_bo_time_sec': float(mean_bo_time),
+        'mean_perturbation_time_sec': float(mean_perturbation_time),
         'mean_ssim_orig_vs_attacked': float(mean_ssim),
         'mean_abs_perturbation': float(mean_abs_perturbation),
         'mean_l2_perturbation': float(mean_l2_perturbation),
         'mean_nonzero_fraction': float(mean_nonzero_fraction),
         'median_iterations': float(median_iterations),
         'median_attack_time_sec': float(median_attack_time),
+        'median_bo_time_sec': float(median_bo_time),
+        'median_perturbation_time_sec': float(median_perturbation_time),
         'median_ssim_orig_vs_attacked': float(median_ssim),
         'median_abs_perturbation': float(median_abs_perturbation),
         'median_l2_perturbation': float(median_l2_perturbation),
         'median_nonzero_fraction': float(median_nonzero_fraction),
         'std_iterations': float(std_iterations),
         'std_attack_time_sec': float(std_attack_time),
+        'std_bo_time_sec': float(std_bo_time),
+        'std_perturbation_time_sec': float(std_perturbation_time),
         'std_ssim_orig_vs_attacked': float(std_ssim),
         'std_abs_perturbation': float(std_abs_perturbation),
         'std_l2_perturbation': float(std_l2_perturbation),
